@@ -1,0 +1,225 @@
+---
+title: "GPS STPE tracks 2019, 2021 - summary info"
+date: "08/12/2021"
+output: 
+  html_document:
+    theme: default
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+## load packages
+
+```{r packages, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(viridis)
+```
+
+```{r, echo=FALSE}
+source("R_scripts/functions/set_ggplot_custom_theme.R")
+```
+
+
+## 1. load and check data
+```{r}
+gps <- readRDS("data_clean/stpe_gps_data_with_tripID.rds")
+
+str(gps)
+
+## Variable Descriptions #############################################
+
+#deployID: band number - tagID - year
+#location: site bird tagged 
+#tagID: gps tag code
+#metalBand: band number
+#species: FTSP or LESP
+#fixFrequency: number of hours between GPS fixes
+#ts: timestamp of the gps fix or attempted fix
+#date: date of gps fix or attempted fix
+#num_satelites: number of satellites used to obtain a fix
+#lat: latitude of gps fix
+#lon: longitude of gps fix
+#batery: battery level at time of gps fix or attempted fix
+#island_lat: tag deployment latitude
+#island_lon: tag deployment longitude
+#tagAttachment: method of tag attachment, TT = tesa tape, SLT = sutures + topical lidocaine, SLI = sutures + injected lidocaine
+#deployYear: year tag deployed
+#deployTime: timetstamp of when tag was deployed
+#retrievalTime: timestamp of when tag was retrieved (retrieval times were not recorded so set to 6am on date of tag retrieval)
+#deployNestStage: nest status (chick or egg) at tag deployment
+#islandDist: distance in km of gps fix from deployment location
+#tripCat: identifies what part of the trip the fix or attempted fix belongs to (tripStart, tripEnd, tripMiddle)
+#completeTrack: a track is considered complete if the last successful fix of a deployment is < 30 km * fixFrequency from the deploy location
+#tripTime: the time from the first trip fix to last trip fix in days (only calculated for complete trips)
+#firstDetect: timestamp of the last fix of the deployment
+#lastDetect: timestamp of the first fix of the deployment
+#tripID: used for birds with more than one trip to differentiate different trips recorded during the same deployment
+
+#####################################################################
+```
+
+## 2. summary info
+
+### number of birds tracked
+```{r}
+nrow(gps %>% select(metalBand) %>% distinct()) #79
+```
+
+### total number of trips recorded
+```{r}
+nrow(gps %>% select(deployID, tripID) %>% distinct()) #111
+```
+
+### num of complete/incomplete trips by island, species and deployNestStage
+```{r, echo=FALSE, message=FALSE}
+knitr::kable(gps %>% 
+               filter(!is.na(lat)) %>%
+               select(deployID, location, species, tripID, deployNestStage, completeTrack) %>%
+               distinct() %>%
+               group_by(location, species, deployNestStage, completeTrack) %>%
+               mutate(completeTrack = ifelse(completeTrack == 0, "no", "yes")) %>%
+               summarise(n = n()) %>%
+               arrange(desc(completeTrack)))
+```
+
+### gps fix success across deployments/trips (complete tracks only)
+```{r, echo=FALSE, message=FALSE}
+knitr::kable(gps %>% 
+               filter(completeTrack == 1) %>%
+               mutate(fix = ifelse(is.na(lat), "unable_to_get_fix", "fix_obtained")) %>%
+               group_by(deployID, location, species, tripID, fix) %>%
+               summarise(n = n()) %>%
+               pivot_wider(names_from = fix, values_from = n) %>%
+               mutate(unable_to_get_fix = replace_na(unable_to_get_fix, 0),
+                      proportion_fixes_successful = round(fix_obtained/(fix_obtained+unable_to_get_fix), digits = 2)) %>%
+               as.data.frame())
+```
+
+
+### Settle time
+#### approximate time between tag deployment/attachement and a bird's departure from the colony (departure time estimated based on first successful fix of a deployment)
+```{r, echo = FALSE, fig.width=10, fig.height=4}
+ttd <- gps %>% select(deployID, ts, deployTime, deployNestStage) %>%
+  group_by(deployID) %>%
+  arrange(ts) %>%
+  slice_head() %>%
+  mutate(timetoDepart = as.numeric(round(difftime(ts, deployTime, units = "hours"), digits = 2)))
+
+brx <- seq(0, max(ttd$timetoDepart), by = 2)
+
+ggplot() +
+  geom_histogram(data = ttd, aes(timetoDepart, fill = deployNestStage),
+                 color = "black", breaks = brx) +
+  scale_x_continuous(breaks = round(seq(0, max(ttd$timetoDepart), by = 10), 0)) +
+  scale_fill_viridis_d(begin = 0.1, end = 0.7) +
+  xlab("time between tagging and departure (hours)")
+
+```
+
+### Colony departure and arrival times 
+#### times estimated based on first and last fix of each trip
+```{r, echo=FALSE, fig.width=10, fig.height=4}
+tda <- gps %>%
+  dplyr::select(ts, tripCat, completeTrack) %>%
+  dplyr::filter(tripCat %in% c("tripStart", "tripEnd") & completeTrack == 1) %>%
+  mutate(hms = as.POSIXct(format(ts, format = "%H:%M:%S"), format = "%H:%M:%S", tz = "America/Vancouver"))
+
+
+ggplot(tda) +
+  geom_histogram(aes(x = hms, fill = tripCat), binwidth = 60*60,  color = "black") +
+  scale_x_datetime(date_breaks = "4 hour",
+                   date_labels = "%H:%M:%S",
+                   timezone = "America/Vancouver",
+                   expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 80), expand = c(0,0)) +
+  xlab("time") +
+  scale_fill_viridis_d(begin = 0.2, end = 1) 
+```
+
+### Trip time and maximum distance traveled away from the colony
+```{r, echo = FALSE, message=FALSE}
+
+#calculate trip time
+tt <- gps %>% 
+  filter(!is.na(lat) & !is.na(deployNestStage)) %>%
+  dplyr::select(location, deployID, tripID, species, deployNestStage, completeTrack, firstDetect, lastDetect) %>%
+  distinct() %>%
+  mutate(tripTime = round(difftime(lastDetect, firstDetect, units = "days"), digits = 2),
+         deployIDt = paste0(deployID, " (t", tripID,")")) 
+
+# %>%
+#   arrange(deployNestStage, location, tripTime) %>%
+#   mutate(deployIDt = factor(deployIDt, levels = deployIDt))
+
+## calculate maximum distance traveled from the colony
+mdist <- gps %>% 
+  filter(!is.na(deployNestStage)) %>%
+  group_by(deployID, tripID, location, species, deployNestStage) %>%
+  summarise(maxdist = max(islandDist, na.rm = TRUE)) %>%
+  mutate(deployIDt = paste0(deployID, " (t", tripID,")")) 
+
+# %>%
+#   arrange(deployNestStage, location, maxdist) %>%
+#   mutate(deployIDt = factor(deployIDt, levels = deployIDt))
+
+```
+
+#### Trip time 
+```{r, echo = FALSE, message=FALSE, fig.width=10, fig.height=4}
+ggplot() +
+  geom_histogram(data = tt, aes(x = tripTime, fill = location), color = "black", binwidth = 1) +
+  facet_grid(.~deployNestStage) +
+  scale_y_continuous(limits = c(0, 20), expand = c(0, 0)) +
+  xlab("trip time (days)") +
+  ylab("# of trips") +
+  scale_fill_viridis_d()
+
+```
+
+#### Maximum distance from colony
+```{r, echo = FALSE, fig.width=10, fig.height=4}
+ggplot() +
+  geom_histogram(data = mdist, aes(x = maxdist, fill = location), color = "black", binwidth = 100) +
+  facet_grid(.~deployNestStage) +
+  scale_y_continuous(limits = c(0, 12), expand = c(0, 0)) +
+  xlab("max distance from colony (km)") +
+  ylab("# of trips") +
+  scale_fill_viridis_d()
+
+```
+
+### Plots of trip time and max distance for individual trips
+#### Total trip time for each trip
+```{r, echo = FALSE, fig.width=10, fig.height=14}
+
+ggplot() +
+  geom_segment(data = tt, aes(x = tripTime, xend = 0, y = deployIDt, yend = deployIDt, color = location), size = 3) +
+  facet_grid(deployNestStage~., scales = "free_y") +
+  scale_x_continuous(limits = c(0, 9), expand = c(0, 0)) +
+  xlab("trip time (days)") +
+  ylab("deploy ID (trip #)") +
+  scale_color_viridis_d()
+
+```
+
+#### Furthest distance from colony for each trip
+```{r, echo = FALSE, fig.width=10, fig.height=14}
+
+ggplot() +
+  geom_segment(data = mdist, aes(x = maxdist, xend = 0, y = deployIDt, yend = deployIDt, color = location), size = 3) +
+  facet_grid(deployNestStage~., scales = "free_y") +
+  scale_x_continuous(limits = c(0, 1500), expand = c(0, 0)) +
+  xlab("max distance from colony (km)") +
+  ylab("deploy ID (trip #)") +
+  scale_color_viridis_d()
+
+```
+
+
+

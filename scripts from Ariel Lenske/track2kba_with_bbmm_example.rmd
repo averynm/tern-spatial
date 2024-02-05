@@ -1,0 +1,568 @@
+---
+title: "track2kba with bbmm example (Storm Island stpe)"
+author: "ariellenske"
+date: "2/06/2022"
+output: 
+  html_document:
+    theme: default
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+## load packages
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(adehabitatHR)
+library(sf)
+library(sp)
+library(raster)
+library(spatialEco)
+library(track2KBA)
+library(patchwork)
+```
+
+### load and format data
+```{r, warning=FALSE, message=FALSE}
+#load data
+gps <- readRDS("data_clean/stpe_gps_data_with_tripID.rds")
+
+#pull out just the Storm Islands data and add id column which combines deployID and trackID
+gps <- gps %>% dplyr::filter(location == "Storm") %>%
+  mutate(id = paste0(deployID,"_trip",tripID))
+
+#remove missed fixes
+gps <- gps %>% dplyr::filter(!is.na(lat))
+
+#make a colony df
+colony <- data.frame(Longitude = gps$island_lon[1],
+                     Latitude = gps$island_lat[1])
+
+# #remove incomplete trips
+# gps <- gps %>% dplyr::filter(completeTrack == 1)
+
+#remove 3 birds with high rates of missing fixes
+gps <- gps %>% dplyr::filter(!deployID %in% c("band115186871-tag20793-2019",
+                                              "band115186873-tag20906-2019",
+                                              "band115186874-tag20809-2019"))
+
+#remove any locations less than 3 km of the colony
+gps <- gps %>% dplyr::filter(islandDist >= 3)
+
+#list of trips 
+blist <- gps %>% dplyr::select(id) %>% distinct() %>% pull()
+
+#list of trip time for each track in minutes
+triptime <- gps %>% 
+  mutate(triptime = as.numeric(gps$lastDetect - gps$firstDetect) * 60) %>%
+  dplyr::select(id, triptime) %>%
+  distinct() %>% 
+  dplyr::select(triptime, id) 
+
+```
+
+
+### make a list that contains trip time for each track in minutes 
+#### used later for calculating a trip length corrected population hotspot raster)
+```{r}
+triptime.list <- gps %>% 
+  mutate(triptime = as.numeric(gps$lastDetect - gps$firstDetect) * 60) %>%
+  dplyr::select(id, triptime) %>%
+  distinct() %>% 
+  dplyr::select(triptime) %>%
+  pull()
+
+```
+
+
+### convert dataframe to a sf object
+```{r}
+gps.sf <- st_as_sf(gps, 
+                   coords = c("lon", "lat"),
+                   crs = 4326)
+```
+
+
+### project locations from lat lon to equal area projection (BC Albers)
+```{r}
+gps.sf <- st_transform(gps.sf, crs = 3153)
+
+```
+
+### format locations as ltraj 'trajectories' (adehabitat package) 
+#### need to do this for function kernelbb
+```{r, fig.width=12, fig.height=12}
+gps.ltraj <- as.ltraj(xy = st_coordinates(gps.sf),
+                        date =  gps.sf$ts,
+                        id = gps.sf$id)
+
+plot(gps.ltraj)
+
+```
+
+
+### Also format tracks for track2kba package
+```{r, fig.width=12, fig.height=12, warning=FALSE, message=FALSE}
+#format for track2kba
+gps.kba <- formatFields(
+  dataGroup = gps, 
+  fieldID   = "id", 
+  fieldDateTime = "ts",
+  fieldLon  = "lon", 
+  fieldLat  = "lat",
+  cleanDF = TRUE)
+
+#trip split (should have a small effect since trips have already been identified)
+gps.kba <- tripSplit(
+  dataGroup  = gps.kba,
+  colony     = colony,
+  innerBuff  = 3,      # kilometers
+  returnBuff = 100,
+  duration   = 8,      # hours
+  rmNonTrip  = FALSE
+)
+
+#trip summary
+sumTrips <- tripSummary(trips = gps.kba, colony = colony)
+
+#map trips
+mapTrips(trips = gps.kba, colony = colony)
+
+#project to equal area
+gps.kba <- spTransform(gps.kba, CRS("+init=epsg:3153"))
+
+```
+
+## 1. brownian bridge movement model UDs
+
+### Find the maximum likelihood estimation of the parameter sig1 for each track and save in a list
+```{r, fig.width=15, fig.height=15}
+sig1 <- liker(gps.ltraj, sig2 = 20, rangesig1 = c(50, 300))
+
+#put the values in a list
+sig1.list <- unname(unlist(lapply(sig1, function(x) x$sig1)))
+```
+
+### Calculate range of sig1 values to test
+
+```{r}
+sig1.list0 <- sig1.list
+sig1.list4 <- sig1.list * 4
+sig1.list8 <- sig1.list * 8
+```
+
+### make a grid for the calculation of the UDs 
+#### this is an easy way to set resolution in terms of m^2 and keep the grid the same for all birds/trips
+```{r}
+#bounding box around the tracks
+bb <- st_bbox(gps.sf)
+
+#create grid points
+# by = pixel size in meters (here I'm using a 5km pixel size, mostly so it doesn't take forever to run)
+x <- seq(unname(bb$xmin) - 200000, unname(bb$xmax) + 200000, by = 5000) 
+y <- seq(unname(bb$ymin) - 200000, unname(bb$ymax) + 200000, by = 5000)
+xy <- expand.grid(x=x,y=y)
+coordinates(xy) <- ~x+y
+proj4string(xy) <- CRS(SRS_string = "EPSG:3153")
+gridded(xy) <- TRUE # make into a spatialPixals object
+
+```
+
+
+### Estimate the brownian bridge UDs
+```{r, warning = FALSE}
+#note: sig2 is location error, here I've input 20, because the Pathtrack gps tags are typically accurate to within ~ 20m. 
+birdbb.0 <- kernelbb(gps.ltraj, sig1 = sig1.list0, sig2 = 20, grid = xy)
+birdbb.4 <- kernelbb(gps.ltraj, sig1 = sig1.list4, sig2 = 20, grid = xy)
+birdbb.8 <- kernelbb(gps.ltraj, sig1 = sig1.list8, sig2 = 20, grid = xy)
+
+```
+
+### plot one trip to check
+```{r, fig.width=10, fig.height=3}
+par(mfrow=c(1,3))
+plot(raster(as(birdbb.0[[1]], "SpatialPixelsDataFrame")))
+plot(raster(as(birdbb.4[[1]], "SpatialPixelsDataFrame")))
+plot(raster(as(birdbb.8[[1]], "SpatialPixelsDataFrame")))
+```
+
+### Convert adehabitat output format for UDs (estUDm) to a raster and put all the rasters in a rasterstack
+```{r}
+raster.list.0 <- lapply(birdbb.0, function(x) (raster(as(x, "SpatialPixelsDataFrame"))))
+raster.stack.0 <- stack(raster.list.0)
+
+raster.list.4 <- lapply(birdbb.4, function(x) (raster(as(x, "SpatialPixelsDataFrame"))))
+raster.stack.4 <- stack(raster.list.4)
+
+raster.list.8 <- lapply(birdbb.8, function(x) (raster(as(x, "SpatialPixelsDataFrame"))))
+raster.stack.8 <- stack(raster.list.8)
+
+```
+
+### Control for trip length 
+#### These trips cover very different spans of time - some trips are only a single day long vs other are up to 7 days long. We need to control for this before combining all the individual rasters or the short trips will dominate the population level raster. To deal with this I mutlipled the individual trip rasters by their associated trip length in minutes (using the list from earlier)
+```{r}
+triptime.list <- triptime %>% dplyr::select(triptime) %>% pull()
+
+raster.stack.adj.0 <- raster.stack.0 * triptime.list
+raster.stack.adj.4 <- raster.stack.4 * triptime.list
+raster.stack.adj.8 <- raster.stack.8 * triptime.list
+
+```
+
+### Combine individual track rasters into a population level hotspot raster
+#### I did this by summing the values in overlapping cells accross all the (trip time adjusted) individual trip rasters
+```{r}
+pop.raster.adj.0 <- calc(raster.stack.adj.0, fun = mean)
+pop.raster.adj.4 <- calc(raster.stack.adj.4, fun = mean)
+pop.raster.adj.8 <- calc(raster.stack.adj.8, fun = mean)
+
+```
+
+
+```{r, fig.width=10, fig.height=3}
+### Population level rasters showing 99% and 50% time 
+pop.c.0 <- calc(stack(raster.vol(pop.raster.adj.0, p=0.99), raster.vol(pop.raster.adj.0, p=0.50)), fun = sum)
+pop.c.4 <- calc(stack(raster.vol(pop.raster.adj.4, p=0.99), raster.vol(pop.raster.adj.4, p=0.50)), fun = sum)
+pop.c.8 <- calc(stack(raster.vol(pop.raster.adj.8, p=0.99), raster.vol(pop.raster.adj.8, p=0.50)), fun = sum)
+
+par(mfrow=c(1,3))
+plot(pop.c.0)
+plot(pop.c.4)
+plot(pop.c.8)
+
+```
+
+## 2. track2kba
+
+### get step 99% and 50% UDs for comparison with bbmm output
+```{r, warning=FALSE, message=FALSE}
+#smoothing parameter options
+hVals <- findScale(
+  tracks = gps.kba,
+  scaleARS = FALSE,
+  sumTrips = sumTrips)
+
+hVals
+
+#step 99
+kde99step <- estSpaceUse(
+  tracks = gps.kba, 
+  res = 5,
+  scale = hVals$step, 
+  levelUD = 99, 
+  polyOut = FALSE
+)
+
+#step 50
+kde50step <- estSpaceUse(
+  tracks = gps.kba, 
+  res = 5,
+  scale = hVals$step, 
+  levelUD = 50, 
+  polyOut = FALSE
+)
+
+#href 99
+kde99href <- estSpaceUse(
+  tracks = gps.kba, 
+  res = 5,
+  scale = hVals$href, 
+  levelUD = 99, 
+  polyOut = FALSE
+)
+
+#href 50
+kde50href <- estSpaceUse(
+  tracks = gps.kba, 
+  res = 5,
+  scale = hVals$href, 
+  levelUD = 50, 
+  polyOut = FALSE
+)
+
+```
+
+
+### track2kba repressentativeness tests
+```{r, message=FALSE, warning=FALSE, fig.show="hide"}
+#little function for doing the plotting separately
+repPlot <- function(df, title.str) {
+
+  df1 <- df[[1]]
+  df2 <- df[[2]]
+
+  P2 <- df2 %>% group_by(.data$SampleSize) %>% dplyr::summarise(meanPred = mean(na.omit(.data$pred)),
+                                                                sdInclude = sd(.data$InclusionRate))
+
+  plot(InclusionRate ~ SampleSize, data = df2, pch = 16,
+       cex = 0.2, col = "darkgray", ylim = c(0,1), xlim = c(0, max(unique(df2$SampleSize))),
+       ylab = "Inclusion", xlab = "Sample Size")
+
+  points(InclusionRate ~ SampleSize, data = df2,
+         pch = 16, cex = 0.2, col = "darkgray")
+
+  lines(P2, lty = 1, lwd = 2)
+
+  text(x = 0, y = 0.99, paste(round(df1$out,
+                                    1), "%", sep = ""), cex = 2, col = "gray45",
+       adj = 0)
+
+  title(title.str)
+}
+
+r99bb.0 <- repAssess(
+  tracks    = gps.kba,
+  KDE       = birdbb.0,
+  levelUD   = 99,
+  iteration = 20,
+  bootTable = TRUE)
+
+r50bb.0 <- repAssess(
+  tracks    = gps.kba,
+  KDE       = birdbb.0,
+  levelUD   = 50,
+  iteration = 20,
+  bootTable = TRUE)
+
+r99bb.4 <- repAssess(
+  tracks    = gps.kba,
+  KDE       = birdbb.4,
+  levelUD   = 99,
+  iteration = 20,
+  bootTable = TRUE)
+
+r50bb.4 <- repAssess(
+  tracks    = gps.kba,
+  KDE       = birdbb.4,
+  levelUD   = 50,
+  iteration = 20,
+  bootTable = TRUE)
+
+r99bb.8 <- repAssess(
+  tracks    = gps.kba,
+  KDE       = birdbb.8,
+  levelUD   = 99,
+  iteration = 20,
+  bootTable = TRUE)
+
+r50bb.8 <- repAssess(
+  tracks    = gps.kba,
+  KDE       = birdbb.8,
+  levelUD   = 50,
+  iteration = 20,
+  bootTable = TRUE)
+
+r99step <- repAssess(
+  tracks    = gps.kba,
+  KDE       = kde99step,
+  levelUD   = 99,
+  iteration = 20,
+  bootTable = TRUE)
+
+r50step <- repAssess(
+  tracks    = gps.kba,
+  KDE       = kde50step,
+  levelUD   = 50,
+  iteration = 20,
+  bootTable = TRUE)
+
+r99href <- repAssess(
+  tracks    = gps.kba,
+  KDE       = kde99href,
+  levelUD   = 99,
+  iteration = 20,
+  bootTable = TRUE)
+
+r50href <- repAssess(
+  tracks    = gps.kba,
+  KDE       = kde50href,
+  levelUD   = 50,
+  iteration = 20,
+  bootTable = TRUE)
+
+
+```
+
+### repAssess plots
+```{r, fig.width= 8, fig.height=12}
+par(mfrow = c(5,2))
+repPlot(df = r99bb.0, t = "99% (bbmm default)")
+repPlot(df = r50bb.0, t = "50% (bbmm default)")
+repPlot(df = r99bb.4, t = "99% (bbmm smooth x4)")
+repPlot(df = r50bb.4, t = "50% (bbmm smooth x4)")
+repPlot(df = r99bb.8, t = "99% (bbmm smooth x8)")
+repPlot(df = r50bb.8, t = "50% (bbmm smooth x8)")
+repPlot(df = r99step, t = "99% (step)")
+repPlot(df = r50step, t = "50% (step)")
+repPlot(df = r99href, t = "99% (href)")
+repPlot(df = r50href, t = "50% (href)")
+
+
+```
+
+
+### track2kba population scale up
+```{r, warning=FALSE, message=FALSE}
+Site99b.0 <- findSite(
+  KDE = birdbb.0,
+  represent = r99bb.0[[1]]$out, 
+  popSize = 200000,
+  levelUD = 99,
+  polyOut = TRUE
+)
+
+Site50b.0 <- findSite(
+  KDE = birdbb.0,
+  represent = r50bb.0[[1]]$out, 
+  popSize = 200000,
+  levelUD = 50,
+  polyOut = TRUE
+)
+
+Site99b.4 <- findSite(
+  KDE = birdbb.4,
+  represent = r99bb.4[[1]]$out, 
+  popSize = 200000,
+  levelUD = 99,
+  polyOut = TRUE
+)
+
+Site50b.4 <- findSite(
+  KDE = birdbb.4,
+  represent = r50bb.4[[1]]$out, 
+  popSize = 200000,
+  levelUD = 50,
+  polyOut = TRUE
+)
+
+Site99b.8 <- findSite(
+  KDE = birdbb.8,
+  represent = r99bb.8[[1]]$out, 
+  popSize = 200000,
+  levelUD = 99,
+  polyOut = TRUE
+)
+
+Site50b.8 <- findSite(
+  KDE = birdbb.8,
+  represent = r50bb.8[[1]]$out, 
+  popSize = 200000,
+  levelUD = 50,
+  polyOut = TRUE
+)
+
+Site99step <- findSite(
+  KDE = kde99step,
+  represent = r99step[[1]]$out, 
+  popSize = 200000,
+  levelUD = 99,
+  polyOut = TRUE
+)
+
+Site50step <- findSite(
+  KDE = kde50step,
+  represent = r50step[[1]]$out, 
+  popSize = 200000,
+  levelUD = 50,
+  polyOut = TRUE
+)
+
+Site99href <- findSite(
+  KDE = kde99href,
+  represent = r99href[[1]]$out, 
+  popSize = 200000,
+  levelUD = 99,
+  polyOut = TRUE
+)
+
+Site50href <- findSite(
+  KDE = kde50href,
+  represent = r50href[[1]]$out, 
+  popSize = 200000,
+  levelUD = 50,
+  polyOut = TRUE
+)
+
+```
+
+### Population maps (define area used by at least 10% of the population)
+```{r, show.fig = "hide"}
+p1 <- mapSite(Site99b.0, colony = colony) + ggtitle("99% (bbmm default)")
+p2 <- mapSite(Site50b.0, colony = colony) + ggtitle("50% (bbmm default)")
+p3 <- mapSite(Site99b.4, colony = colony) + ggtitle("99% (bbmm smooth x4)")
+p4 <- mapSite(Site50b.4, colony = colony) + ggtitle("50% (bbmm smooth x4)")
+p5 <- mapSite(Site99b.8, colony = colony) + ggtitle("99% (bbmm smooth x8)")
+p6 <- mapSite(Site50b.8, colony = colony) + ggtitle("50% (bbmm smooth x8)")
+p7 <- mapSite(Site99step, colony = colony) + ggtitle("99% (kde step)")
+p8 <- mapSite(Site50step, colony = colony) + ggtitle("50% (kde step)")
+p9 <- mapSite(Site99href, colony = colony) + ggtitle("99% (kde href)")
+p10 <- mapSite(Site50href, colony = colony) + ggtitle("50% (kde href)")
+```
+
+
+```{r, fig.width = 11, fig.height = 18}
+(p1 | p2 ) / (p3 | p4) / (p5 | p6) / (p7 | p8) / (p9 | p10)
+```
+
+### look at relationship between relocations and UD estimates
+```{r, warning=FALSE, message=FALSE}
+v99.0 <- getverticeshr(birdbb.0[[8]], percent = 99) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "99% (bbmm default)")
+
+v50.0 <- getverticeshr(birdbb.0[[8]], percent = 50) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "50% (bbmm default)")
+
+v99.4 <- getverticeshr(birdbb.4[[8]], percent = 99) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "99% (bbmm smooth x4)")
+
+v50.4 <- getverticeshr(birdbb.4[[8]], percent = 50) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "50% (bbmm smooth x4)")
+
+v99.8 <- getverticeshr(birdbb.8[[8]], percent = 99) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "99% (bbmm smooth x8)")
+
+v50.8 <- getverticeshr(birdbb.8[[8]], percent = 50) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "50% (bbmm smooth x8)")
+
+v99.step <- getverticeshr(kde99step[[8]], percent = 99) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "99% (kde step)")
+
+v50.step <- getverticeshr(kde50step[[8]], percent = 50) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "50% (kde step)")
+
+v99.href <- getverticeshr(kde99href[[8]], percent = 99) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "99% (kde href)")
+
+v50.href <- getverticeshr(kde50href[[8]], percent = 50) %>% 
+  st_as_sf() %>% 
+  mutate(ud.type = "50% (kde href)")
+
+
+test <- rbind(v99.0, v50.0, v99.4, v50.4, v99.8, v50.8, v99.step, v50.step, v99.href, v50.href)
+
+```
+
+### Plot
+```{r, fig.width=12, fig.height=5}
+ggplot() + 
+  geom_sf(data = test, aes(fill = ud.type), color = NA, alpha = 0.5) +
+  geom_sf(data = gps.sf %>% dplyr::filter(id == blist[8]), size = 0.2, color = "black") +
+  facet_wrap(~ud.type, ncol = 5) +
+  theme(legend.position = "none")
+```
+
