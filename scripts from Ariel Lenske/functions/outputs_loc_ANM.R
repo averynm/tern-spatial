@@ -4,6 +4,6 @@
 #2022-12-06
 ###############################################################################
 outputs_loc <- function(outputfolder) {
-  file.path("C:", "Users", "My Drive", "MSc", "Data and Analyses", "Tern spatial data analysis",
+  file.path("C:", "Users", "agnag", "Documents", "MSc", "Tern spatial data analysis",
             outputfolder)
 }

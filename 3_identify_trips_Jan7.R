@@ -225,7 +225,7 @@ gps <- left_join(gps, sun) %>%
 
 rm(sun)
 
-#11.0 categorize trips as complete or not
+#11.0 categorize trips as complete (1) or not (0)
 gps <- gps %>%
   group_by(BirdID, tripID) %>%
   arrange(ts) %>%
@@ -284,7 +284,7 @@ for(i in 1:length(dlist)){
     guides(colour = guide_colourbar(barwidth=25)) +
     ylab("Distance from Colony (m)") + xlab("Time")
   
-  png(filename = file.path("C:/Users/agnag/My Drive/MSc/Data and Analyses/Tern spatial data analysis/figs/trip-splitting-plots",
+  png(filename = file.path("C:/Users/agnag/Documents/MSc/Tern spatial data analysis/figs",
                            paste0(dep$species, "_",
                                   dep$deployYear, "_birdID_",
                                   dep$BirdID, ".png")),
@@ -300,4 +300,5 @@ for(i in 1:length(dlist)){
 }
 rm(i)
 
-
+#save dataframe
+saveRDS(gps, "data_clean/tern_gps_data_with_tripID.rds")
